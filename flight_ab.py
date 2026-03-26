@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
 Скрипт керування дроном через RC Override у режимі STABILIZE.
-
-RC Override = ми програмно "підробляємо" сигнали радіопульта.
-Замість того щоб людина крутила стіки — наш код відправляє
-числові значення (1000-2000 мкс) напряму в автопілот.
-
 Маршрут: Точка А (50.450739, 30.461242) → Точка Б (50.443326, 30.448078)
 Висота польоту: 100 метрів
 """
@@ -14,264 +9,291 @@ from dronekit import connect, VehicleMode, LocationGlobalRelative
 import time
 import math
 
-# ═══════════════════════════════════════════════════════════════════
-# НАЛАШТУВАННЯ ПІДКЛЮЧЕННЯ
-# ═══════════════════════════════════════════════════════════════════
-
-# Адреса підключення до автопілота.
-# tcp:127.0.0.1:5762 = підключення через TCP до локального SITL симулятора
-# Для реального дрона це буде інша адреса, наприклад:
-# '/dev/ttyUSB0'     = USB кабель на Linux
-# 'COM3'             = USB кабель на Windows
-# 'udp:192.168.1.1:14550' = WiFi підключення
 CONNECTION_STRING = 'tcp:127.0.0.1:5762'
 
-# ═══════════════════════════════════════════════════════════════════
-# GPS КООРДИНАТИ
-# ═══════════════════════════════════════════════════════════════════
-
-# Точка старту (Київ, Шевченківський район)
-# Формат: (широта, довгота)
-# Широта  = North/South (північ/південь), діапазон -90..+90
-# Довгота = East/West   (схід/захід),    діапазон -180..+180
 POINT_A = (50.450739, 30.461242)
-
-# Точка призначення — сюди має прилетіти і сісти дрон
 POINT_B = (50.443326, 30.448078)
+TARGET_ALT  = 100.0
+EARTH_RADIUS = 6371000
 
-# Висота польоту в метрах.
-# Відраховується відносно точки зльоту (home point), не від рівня моря.
-# Тобто якщо злетів з даху будинку — 100м буде від даху.
-TARGET_ALT = 100.0
-
-# ═══════════════════════════════════════════════════════════════════
-# RC (RADIO CONTROL) ПАРАМЕТРИ
-# ═══════════════════════════════════════════════════════════════════
-
-# Нейтральне положення стіка пульта = 1500 мікросекунд (мкс).
-# Це середина діапазону. Означає "нічого не роби" для roll/pitch/yaw,
-# і "утримуй поточну висоту" для throttle у деяких режимах.
-RC_NEUTRAL = 1500
-
-# Мінімальне значення RC сигналу = 1000 мкс.
-# Відповідає максимальному відхиленню стіка в одну сторону:
-# - Roll:     максимальний нахил вліво
-# - Pitch:    максимальний нахил вперед (летить вперед)
-# - Throttle: мотори вимкнені (газ нуль)
-# - Yaw:      максимальний поворот вліво
-RC_MIN = 1000
-
-# Максимальне значення RC сигналу = 2000 мкс.
-# Відповідає максимальному відхиленню стіка в іншу сторону:
-# - Roll:     максимальний нахил вправо
-# - Pitch:    максимальний нахил назад
-# - Throttle: максимальний газ (летить вгору)
-# - Yaw:      максимальний поворот вправо
-RC_MAX = 2000
-
-# Значення газу (throttle, CH3) для утримання висоти 100м.
-# 1500 = теоретична нейтраль, але кожен дрон має різну вагу і тягу,
-# тому підбирається вручну:
-# - Дрон набирає висоту → зменшуй (1490, 1480, 1470...)
-# - Дрон втрачає висоту → збільшуй (1510, 1520...)
-# Це базове значення, до якого додається PID корекція висоти.
+RC_NEUTRAL    = 1500
+RC_MIN        = 1000
+RC_MAX        = 2000
 THROTTLE_HOLD = 1470
 
-# ═══════════════════════════════════════════════════════════════════
-# НАВІГАЦІЙНІ ПАРАМЕТРИ
-# ═══════════════════════════════════════════════════════════════════
-
-# Радіус прибуття в метрах.
-# Коли відстань до точки Б менша за це значення — вважаємо що прилетіли.
-# Менше значення = точніша навігація, але складніше досягти:
-# 5.0м = легко досягти, груба точність
-# 2.0м = гарний баланс точності і надійності
-# 0.5м = дуже точно, потребує ідеального налаштування PID
-ARRIVAL_RADIUS = 2.0
-
-# ═══════════════════════════════════════════════════════════════════
-# МАТЕМАТИЧНІ КОНСТАНТИ
-# ═══════════════════════════════════════════════════════════════════
-
-# Радіус Землі в метрах = 6 371 000 м (6371 км).
-# Використовується у формулі Haversine для розрахунку відстані
-# між двома GPS координатами по поверхні сфери (Землі).
-# Без цього числа ми не можемо перевести різницю в градусах
-# широти/довготи у реальні метри.
-EARTH_RADIUS = 6371000
+# ── ВИПРАВЛЕННЯ 1: зменшили з 8.0 до 3.0м ───────────────────────────────────
+# Менший радіус = точніше прибуття = точніша посадка
+ARRIVAL_RADIUS = 5.5 # 3.0
 
 # ═══════════════════════════════════════════════════════════════════
 # ДОПОМІЖНІ ФУНКЦІЇ
 # ═══════════════════════════════════════════════════════════════════
 
 def get_distance_m(lat1, lon1, lat2, lon2):
-    """
-    Розраховує відстань між двома GPS точками у метрах.
-
-    Використовує формулу Haversine — найточніший спосіб
-    розрахувати відстань по поверхні кулі (Землі).
-    Звичайна теорема Піфагора тут не підходить бо Земля кругла.
-
-    Приклад:
-        dist = get_distance_m(50.450739, 30.461242,
-                              50.443326, 30.448078)
-        # dist ≈ 1456 метрів
-    """
-    # Переводимо градуси в радіани (математика працює з радіанами)
-    phi1 = math.radians(lat1)   # широта точки 1
-    phi2 = math.radians(lat2)   # широта точки 2
-    dphi = math.radians(lat2 - lat1)   # різниця широт
-    dlam = math.radians(lon2 - lon1)   # різниця довгот
-
-    # Формула Haversine
-    a = (math.sin(dphi / 2) ** 2 +
-         math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
-
-    return EARTH_RADIUS * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    """Відстань між GPS точками у метрах (Haversine)."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = (math.sin(dphi/2)**2 +
+         math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2)
+    return EARTH_RADIUS * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 
 def get_bearing(lat1, lon1, lat2, lon2):
-    """
-    Розраховує азимут (bearing) від точки 1 до точки 2 у градусах.
-
-    Азимут = кут відносно Півночі, за годинниковою стрілкою:
-        0°   = Північ
-        90°  = Схід
-        180° = Південь
-        270° = Захід
-
-    Це потрібно щоб знати в якому напрямку повернути дрон.
-    """
+    """Азимут від точки 1 до точки 2 (0=Північ, 90=Схід)."""
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dlam = math.radians(lon2 - lon1)
-
-    x = math.sin(dlam) * math.cos(phi2)
-    y = (math.cos(phi1) * math.sin(phi2) -
-         math.sin(phi1) * math.cos(phi2) * math.cos(dlam))
-
-    # atan2 повертає кут в радіанах (-π..+π), переводимо в градуси (0..360)
+    x = math.sin(dlam)*math.cos(phi2)
+    y = (math.cos(phi1)*math.sin(phi2) -
+         math.sin(phi1)*math.cos(phi2)*math.cos(dlam))
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
 def heading_error(current, target):
     """
-    Розраховує різницю між поточним курсом і потрібним курсом.
-
-    Повертає значення в діапазоні -180..+180 градусів:
-        + = треба повернути вправо
-        - = треба повернути вліво
-
-    Без цієї функції була б проблема wraparound:
-    Якщо поточний курс 350° а потрібний 10°,
-    наївний розрахунок дав би 10-350 = -340° (повертай вліво 340°!)
-    Але правильна відповідь: +20° (повертай вправо лише 20°).
+    Різниця курсів (-180..+180).
+    + = треба вправо, - = треба вліво.
     """
     err = target - current
-    if err > 180:
-        err -= 360   # коротший шлях вліво
-    if err < -180:
-        err += 360   # коротший шлях вправо
+    if err >  180: err -= 360
+    if err < -180: err += 360
     return err
 
 
 def clamp(val, lo, hi):
-    """
-    Обмежує значення у діапазоні [lo, hi].
-
-    Потрібно щоб RC сигнали не виходили за межі 1000-2000.
-    Наприклад якщо PID порахував throttle = 2500 —
-    clamp поверне 2000 (максимально дозволене).
-    """
+    """Обмежує значення у діапазоні [lo, hi]."""
     return max(lo, min(hi, val))
 
 
 def send_rc(vehicle, ch1=RC_NEUTRAL, ch2=RC_NEUTRAL,
             ch3=RC_NEUTRAL, ch4=RC_NEUTRAL):
     """
-    Відправляє RC Override команди до автопілота.
-
-    RC Override = перехоплення сигналів радіопульта.
-    Ми кажемо автопілоту: "ігноруй реальний пульт,
-    використовуй ці значення які ми надсилаємо програмно".
-
-    Канали:
-        CH1 (Roll):     1000=ліво,    1500=нейтраль, 2000=право
-        CH2 (Pitch):    1000=вперед,  1500=нейтраль, 2000=назад
-        CH3 (Throttle): 1000=вниз,    1500=утримання,2000=вгору
-        CH4 (Yaw):      1000=вліво,   1500=нейтраль, 2000=вправо
-
-    Важливо: треба відправляти команди кожні ~50мс (20 Гц),
-    інакше автопілот вирішить що зв'язок втрачено і
-    скине override (дрон зупиниться або впаде).
+    Відправляє RC Override.
+    CH1=Roll, CH2=Pitch, CH3=Throttle, CH4=Yaw.
+    Відправляти кожні ~50мс інакше автопілот скине override.
     """
     vehicle.channels.overrides = {
-        '1': clamp(int(ch1), RC_MIN, RC_MAX),  # Roll
-        '2': clamp(int(ch2), RC_MIN, RC_MAX),  # Pitch
-        '3': clamp(int(ch3), RC_MIN, RC_MAX),  # Throttle
-        '4': clamp(int(ch4), RC_MIN, RC_MAX),  # Yaw
+        '1': clamp(int(ch1), RC_MIN, RC_MAX),
+        '2': clamp(int(ch2), RC_MIN, RC_MAX),
+        '3': clamp(int(ch3), RC_MIN, RC_MAX),
+        '4': clamp(int(ch4), RC_MIN, RC_MAX),
     }
 
 
 def get_speed(vehicle):
-    """
-    Розраховує горизонтальну швидкість дрона у м/с.
+    """Горизонтальна швидкість у м/с."""
+    vx = vehicle.velocity[0]
+    vy = vehicle.velocity[1]
+    return math.sqrt(vx**2 + vy**2)
 
-    vehicle.velocity повертає вектор [vx, vy, vz]:
-        vx = швидкість на Північ (м/с)
-        vy = швидкість на Схід  (м/с)
-        vz = вертикальна швидкість (м/с, + = вниз)
 
-    Горизонтальна швидкість = довжина вектора (vx, vy)
-    за теоремою Піфагора.
+# ═══════════════════════════════════════════════════════════════════
+# ВИМІРЮВАННЯ HOVER THROTTLE
+# ═══════════════════════════════════════════════════════════════════
+
+def measure_hover_throttle(vehicle):
     """
-    vx = vehicle.velocity[0]  # північ/південь
-    vy = vehicle.velocity[1]  # схід/захід
-    return math.sqrt(vx ** 2 + vy ** 2)
+    Читає hover throttle з параметрів ArduPilot.
+    MOT_THST_HOVER: 0.0..1.0 → конвертуємо в мкс.
+    Додано захист від занижених значень.
+    """
+    for param_name in ['MOT_THST_HOVER', 'THR_MID']:
+        val = vehicle.parameters.get(param_name, None)
+        if val is not None:
+            if param_name == 'THR_MID':
+                # THR_MID вже в діапазоні 0..1000
+                hover_us = int(1000 + val)
+            else:
+                # MOT_THST_HOVER: 0.0..1.0
+                hover_us = int(1000 + val * 1000)
+
+            print(f"  {param_name}: {val:.3f} → {hover_us} мкс")
+
+            # ── ВИПРАВЛЕННЯ 2: захист від занижених значень ───────────────────
+            # MOT_THST_HOVER часто занижений бо ArduPilot вчиться під навантаженням.
+            # Мінімум 1430 мкс — нижче цього дрон точно буде падати.
+            if hover_us < 1430:
+                corrected = max(hover_us + 80, 1450)
+                print(f"  ⚠️  Значення занижене! Корегуємо: {hover_us} → {corrected} мкс")
+                return corrected
+
+            if hover_us > 1650:
+                print(f"  ⚠️  Значення завищене! Використовуємо 1500 мкс")
+                return 1500
+
+            return hover_us
+
+    print("  ⚠️  Параметр не знайдено, використовуємо 1470 мкс")
+    return 1470
 
 
 # ═══════════════════════════════════════════════════════════════════
 # ЗЛІТ
 # ═══════════════════════════════════════════════════════════════════
 
-def arm_and_takeoff(vehicle, target_altitude):
-    """
-    Підготовка і зліт дрона до заданої висоти.
-
-    Arm = увімкнення моторів (як запуск двигуна в авто).
-    Без arm дрон не реагує на газ — це захист від випадкового запуску.
-
-    Зліт відбувається в режимі GUIDED — автопілот сам
-    стабілізує і набирає висоту. Після досягнення висоти
-    ми переключимось на STABILIZE для RC Override навігації.
-    """
+def arm_and_takeoff(vehicle, altitude):
+    """Arm і зліт до заданої висоти в GUIDED."""
     print("Очікуємо pre-arm checks...")
-    # Pre-arm checks = автопілот перевіряє чи все готово до польоту:
-    # GPS зафіксований, батарея заряджена, датчики калібровані тощо
     while not vehicle.is_armable:
         time.sleep(1)
 
-    print("Встановлюємо GUIDED, arm...")
-    vehicle.mode = VehicleMode("GUIDED")  # режим автоматичного керування
-    vehicle.armed = True                   # вмикаємо мотори
-
+    vehicle.mode  = VehicleMode("GUIDED")
+    vehicle.armed = True
     while not vehicle.armed:
         print("  Очікуємо arm...")
         time.sleep(1)
 
-    print(f"Злітаємо до {target_altitude} м...")
-    # simple_takeoff = вбудована команда ArduPilot "злети до цієї висоти"
-    vehicle.simple_takeoff(target_altitude)
+    print(f"Злітаємо до {altitude}м...")
+    vehicle.simple_takeoff(altitude)
 
     while True:
-        # global_relative_frame = висота відносно точки зльоту
-        # (на відміну від global_frame = висота від рівня моря)
         alt = vehicle.location.global_relative_frame.alt
-        print(f"  Висота: {alt:.1f} м")
-        if alt >= target_altitude - 1.0:  # ±1м допустима похибка
-            print(f"✅ Досягнуто {alt:.1f} м!")
+        print(f"  Висота: {alt:.1f}м")
+        if alt >= altitude - 1.0:
+            print(f"✅ Висота {alt:.1f}м досягнута!")
             break
         time.sleep(0.3)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# НАВІГАЦІЯ А → Б
+# ═══════════════════════════════════════════════════════════════════
+
+def navigate_to_target(vehicle, target_lat, target_lon,
+                       target_alt, arrival_radius=3.0):
+    """
+    Навігація в STABILIZE через RC Override.
+
+    Використовує позиційне керування через Roll + Pitch:
+    - Розкладаємо вектор до цілі на осі дрона (вперед/вбік)
+    - Pitch = рух вперед/назад
+    - Roll  = рух вбік (компенсація бокового зносу від вітру)
+    - Yaw   = повертаємо ніс до цілі
+    - Throttle = утримання висоти 100м
+
+    Швидкість автоматично зменшується при наближенні до цілі.
+    """
+
+    # Yaw: мкс на градус помилки курсу
+    YAW_KP  = 2.5
+    YAW_KI  = 0.08   # інтегральна складова для компенсації вітру
+    YAW_MAX = 80
+
+    # Throttle: корекція висоти
+    ALT_KP  = 3.0
+    ALT_MAX = 150
+
+    LOOP_DT = 0.05  # 20 Гц
+
+    yaw_integral = 0.0
+
+    prev_time = time.time()
+    prev_dist = get_distance_m(
+        vehicle.location.global_relative_frame.lat,
+        vehicle.location.global_relative_frame.lon,
+        target_lat, target_lon
+    )
+
+    print(f"Початкова відстань: {prev_dist:.1f}м")
+    print(f"Bearing А→Б: "
+          f"{get_bearing(POINT_A[0], POINT_A[1], target_lat, target_lon):.1f}°")
+
+    while True:
+        loc      = vehicle.location.global_relative_frame
+        curr_lat = loc.lat
+        curr_lon = loc.lon
+        curr_alt = loc.alt
+        curr_hdg = vehicle.heading
+
+        dist    = get_distance_m(curr_lat, curr_lon, target_lat, target_lon)
+        bearing = get_bearing(curr_lat, curr_lon, target_lat, target_lon)
+        yaw_err = heading_error(curr_hdg, bearing)
+        speed   = get_speed(vehicle)
+
+        now           = time.time()
+        dt            = now - prev_time
+        closing_speed = (prev_dist - dist) / dt if dt > 0 else 0
+        prev_time     = now
+        prev_dist     = dist
+
+        # ── Перевірка прибуття ────────────────────────────────────────────────
+        if dist < arrival_radius:
+            print(f"\n✅ Прибули! Відстань: {dist:.2f}м")
+            # Нейтраль — гасимо швидкість
+            send_rc(vehicle, ch3=THROTTLE_HOLD)
+            time.sleep(0.5)
+            break
+
+        # ── Yaw PI: повертаємо ніс до цілі ───────────────────────────────────
+        if abs(yaw_err) < 30:
+            yaw_integral += yaw_err * LOOP_DT
+            yaw_integral  = clamp(yaw_integral, -20.0, 20.0)
+        else:
+            yaw_integral = 0.0
+
+        yaw_out = RC_NEUTRAL + clamp(
+            yaw_err * YAW_KP + yaw_integral * YAW_KI,
+            -YAW_MAX, YAW_MAX
+        )
+
+        # ── Позиційне керування Roll + Pitch ──────────────────────────────────
+        # Зміщення до цілі в метрах (по осях північ/схід)
+        dlat_m = (target_lat - curr_lat) * 111320
+        dlon_m = (target_lon - curr_lon) * 111320 * math.cos(
+            math.radians(curr_lat)
+        )
+
+        # Проекція на осі дрона з урахуванням поточного курсу
+        hdg_rad   = math.radians(curr_hdg)
+        fwd_err   =  dlat_m * math.cos(hdg_rad) + dlon_m * math.sin(hdg_rad)
+        right_err = -dlat_m * math.sin(hdg_rad) + dlon_m * math.cos(hdg_rad)
+
+        # ── ВИПРАВЛЕННЯ 3: динамічний pos_kp залежно від швидкості ───────────
+        # Якщо летимо швидко і близько — зменшуємо pos_kp щоб не пролетіти.
+        # speed_factor: при 8м/с і dist<50м зменшує kp в 2 рази.
+        # Динамічний pos_kp: далеко — помірно, близько — агресивно
+        # speed_factor зменшує kp при великій швидкості (захист від перельоту)
+        speed_factor = clamp(1.0 - (speed - 3.0) * 0.05, 0.4, 1.0)
+
+        if dist > 50:
+            pos_kp = 10.0 * speed_factor
+        elif dist > 20:
+            pos_kp = 16.0 * speed_factor
+        elif dist > 10:
+            pos_kp = 22.0 * speed_factor
+        elif dist > 5:
+            pos_kp = 35.0   # збільшили — вітер не зупинить
+        else:
+            pos_kp = 50.0   # максимум на фіналі
+
+        # Обмеження pitch при великій швидкості і малій відстані
+        POS_MAX = 280
+        if speed > 6.0 and dist < 100:
+            POS_MAX = int(280 * clamp(dist / 100.0, 0.3, 1.0))
+
+        pitch_out = RC_NEUTRAL - clamp(fwd_err   * pos_kp, -POS_MAX, POS_MAX)
+        roll_out  = RC_NEUTRAL + clamp(right_err * pos_kp, -POS_MAX, POS_MAX)
+
+        # ── Throttle: утримання висоти ────────────────────────────────────────
+        alt_err      = target_alt - curr_alt
+        throttle_out = THROTTLE_HOLD + clamp(alt_err * ALT_KP,
+                                             -ALT_MAX, ALT_MAX)
+
+        print(f"Dist:{dist:6.1f}м | Alt:{curr_alt:5.1f}м | "
+              f"Hdg:{curr_hdg:3.0f}° | Bear:{bearing:3.0f}° | "
+              f"YawErr:{yaw_err:+5.1f}° | Fwd:{fwd_err:+6.1f}м | "
+              f"Right:{right_err:+6.1f}м | "
+              f"Spd:{speed:4.1f}м/с | Cls:{closing_speed:+4.1f}")
+
+        send_rc(vehicle,
+                ch1=roll_out,
+                ch2=pitch_out,
+                ch3=throttle_out,
+                ch4=yaw_out)
+
+        time.sleep(LOOP_DT)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -280,30 +302,34 @@ def arm_and_takeoff(vehicle, target_altitude):
 
 def safe_land(vehicle, point_b):
     """
-    Двоетапна надійна посадка точно в точку Б.
+    Триетапна точна посадка в точку Б.
 
-    Етап 1: GUIDED режим — летимо точно над точкою Б на висоті 10м.
-            Автопілот сам керує, ми тільки задаємо координати.
-
-    Етап 2: LAND режим — автопілот повільно опускається вниз.
-            Ми відстежуємо вертикальну швидкість щоб визначити
-            момент торкання землі і не йти в мінус.
+    Етап 1: Вимірюємо hover throttle.
+    Етап 2: GUIDED — швидко спускаємось до 5м над точкою Б.
+    Етап 3: STABILIZE + RC Override — контрольований спуск
+            з Vz регулятором і позиційною корекцією.
     """
     print("\nПочинаємо процедуру посадки...")
-
-    # Скидаємо RC Override — повертаємо керування автопілоту
     vehicle.channels.overrides = {}
     time.sleep(0.3)
 
-    # ── Етап 1: зависаємо над точкою Б на 10м ────────────────────────────────
-    print("Знижуємось до 10м у GUIDED...")
+    # ── Етап 1: вимірюємо hover throttle ─────────────────────────────────────
+    print("Вимірюємо hover throttle...")
+    hover_thr = measure_hover_throttle(vehicle)
+    print(f"  Hover: {hover_thr} мкс")
+
+    # ── Етап 2: GUIDED до 5м над точкою Б ────────────────────────────────────
+    print("GUIDED: спускаємось до 5м над точкою Б...")
     vehicle.mode = VehicleMode("GUIDED")
     time.sleep(0.5)
 
-    # LocationGlobalRelative = GPS координати + висота відносно home
-    hover_point = LocationGlobalRelative(point_b[0], point_b[1], 10.0)
-    vehicle.simple_goto(hover_point)  # летимо до цієї точки
+    # ── ВИПРАВЛЕННЯ 5: airspeed=5 — швидше спускаємось ───────────────────────
+    vehicle.simple_goto(
+        LocationGlobalRelative(point_b[0], point_b[1], 5.0),
+        airspeed=5
+    )
 
+    timeout = time.time() + 120  # максимум 2 хвилини на спуск
     while True:
         alt  = vehicle.location.global_relative_frame.alt
         dist = get_distance_m(
@@ -311,88 +337,138 @@ def safe_land(vehicle, point_b):
             vehicle.location.global_relative_frame.lon,
             point_b[0], point_b[1]
         )
-        print(f"  До точки Б: {dist:.1f}м | Висота: {alt:.1f}м")
-        # Чекаємо поки будемо менше 1.5м від точки Б і на висоті ~10м
-        if dist < 1.5 and abs(alt - 10.0) < 2.0:
-            print("✅ Зависаємо над точкою Б на 10м")
+        print(f"  Dist:{dist:.1f}м | Alt:{alt:.1f}м")
+
+        #if dist < 1.0 and abs(alt - 5.0) < 1.5:
+        if dist < 0.3 and abs(alt - 5.0) < 1.5:
+            print("✅ Над точкою Б на 5м")
             break
+
+        # Таймаут — якщо не може дістатись за 2 хвилини
+        if time.time() > timeout:
+            print("⚠️  Таймаут GUIDED спуску — продовжуємо з поточної позиції")
+            break
+
         time.sleep(0.5)
 
-    # Зависаємо 2 секунди щоб стабілізуватись (погасити коливання)
-    print("Стабілізація...")
+    print("Стабілізація 2с...")
     time.sleep(2.0)
 
-    # ── Етап 2: фінальна посадка ──────────────────────────────────────────────
-    print("Фінальна посадка (LAND)...")
-    vehicle.mode = VehicleMode("LAND")
+    # ── Етап 3: STABILIZE — контрольований спуск ─────────────────────────────
+    print("STABILIZE: фінальна посадка з RC Override...")
+    vehicle.mode = VehicleMode("STABILIZE")
+    time.sleep(0.5)
 
-    last_vz     = []  # буфер останніх значень вертикальної швидкості
-    touch_count = 0   # лічильник підтверджень торкання
+    # Цільова швидкість спуску (м/с, + = вниз)
+    # 1.0 м/с = плавний спуск (знизили з 1.5 для кращого контролю)
+    TARGET_VZ = 1.0
+
+    # P-регулятор вертикальної швидкості
+    # Більше = швидша реакція на зміну Vz
+    VZ_KP  = 80.0   # збільшили з 60 для кращого гальмування при падінні
+    VZ_MAX = 200    # збільшили максимум корекції
+
+    # Позиційна корекція (компенсація вітру під час спуску)
+    POS_KP  = 20.0
+    POS_MAX = 200
+
+    last_vz     = []
+    touch_count = 0
     start_time  = time.time()
 
     while True:
-        alt   = vehicle.location.global_relative_frame.alt
-        vz    = vehicle.velocity[2]   # вертикальна швидкість (+ = вниз)
-        armed = vehicle.armed
+        loc      = vehicle.location.global_relative_frame
+        curr_lat = loc.lat
+        curr_lon = loc.lon
+        curr_alt = loc.alt
+        curr_hdg = vehicle.heading
+        vz       = vehicle.velocity[2]  # + = вниз
 
-        # Зберігаємо останні 8 вимірів швидкості для усереднення
-        # (захист від випадкових стрибків показань датчика)
+        # ── Throttle Vz регулятор ─────────────────────────────────────────────
+        # Якщо висота <= 0.2м — торкнулись землі, вимикаємо мотори.
+        # Це запобігає відскоку: після торкання Vz стає від'ємним (летить вгору)
+        # і регулятор без цієї перевірки дав би максимальний газ THR:1669.
+        if curr_alt <= 0.2:
+            throttle_out = 1000  # мотори вимкнути — залишаємось на землі
+        else:
+            # vz_err > 0: падаємо швидше ніж треба → додаємо газ
+            # vz_err < 0: падаємо повільніше       → зменшуємо газ
+            vz_err       = vz - TARGET_VZ
+            throttle_out = hover_thr - clamp(vz_err * VZ_KP, -VZ_MAX, VZ_MAX)
+            # Мінімум 1200 — не даємо газу впасти занадто низько
+            throttle_out = clamp(throttle_out, 1200, RC_MAX)
+
+        # ── Позиційна корекція Roll/Pitch ─────────────────────────────────────
+        dlat_m = (point_b[0] - curr_lat) * 111320
+        dlon_m = (point_b[1] - curr_lon) * 111320 * math.cos(
+            math.radians(curr_lat)
+        )
+
+        hdg_rad   = math.radians(curr_hdg)
+        fwd_err   =  dlat_m * math.cos(hdg_rad) + dlon_m * math.sin(hdg_rad)
+        right_err = -dlat_m * math.sin(hdg_rad) + dlon_m * math.cos(hdg_rad)
+
+        pitch_out = RC_NEUTRAL - clamp(fwd_err   * POS_KP, -POS_MAX, POS_MAX)
+        roll_out  = RC_NEUTRAL + clamp(right_err * POS_KP, -POS_MAX, POS_MAX)
+
+        dist_to_b = get_distance_m(curr_lat, curr_lon,
+                                   point_b[0], point_b[1])
+
+        print(f"  Alt:{curr_alt:+.2f}м | Dist:{dist_to_b:.2f}м | "
+              f"Vz:{vz:+.2f}м/с (ціль:{TARGET_VZ}) | "
+              f"THR:{int(throttle_out)} | "
+              f"Pitch:{int(pitch_out)} | Roll:{int(roll_out)}")
+
+        send_rc(vehicle,
+                ch1=roll_out,
+                ch2=pitch_out,
+                ch3=throttle_out,
+                ch4=RC_NEUTRAL)
+
+        # ── Визначення торкання землі ─────────────────────────────────────────
         last_vz.append(abs(vz))
         if len(last_vz) > 8:
-            last_vz.pop(0)  # видаляємо найстаріший вимір
-
-        # Середнє значення вертикальної швидкості за останні 8 вимірів
+            last_vz.pop(0)
         avg_vz = sum(last_vz) / len(last_vz)
 
-        print(f"  Висота: {alt:+.2f}м | Vz: {vz:+.3f}м/с | "
-              f"Avg Vz: {avg_vz:.3f}м/с | Armed: {armed}")
-
-        # Торкання землі = дрон фізично зупинився.
-        # Коли дрон сідає — земля зупиняє його рух вниз,
-        # тому вертикальна швидкість падає до ~0.
-        # avg_vz < 0.08 = майже не рухається вертикально
-        # len >= 8 = маємо достатньо даних для впевненого висновку
-        touching = (avg_vz < 0.08 and len(last_vz) >= 8)
+        # Торкання = вертикальна швидкість впала до нуля + низька висота
+        touching = (avg_vz < 0.12 and len(last_vz) >= 8 and curr_alt < 1.5)
 
         if touching:
             touch_count += 1
             print(f"  Торкання підтверджується ({touch_count}/6)...")
         else:
-            # Якщо знову почав рухатись — скидаємо лічильник
             touch_count = 0
 
-        # 6 підтверджень поспіль = точно на землі, не випадковий шум
         if touch_count >= 6:
-            print("✅ Торкання землі підтверджено по швидкості!")
-            vehicle.channels.overrides = {'3': 1000}  # газ в нуль
+            print("✅ Торкання землі підтверджено!")
+            vehicle.channels.overrides = {'3': 1000}
             time.sleep(0.5)
             vehicle.channels.overrides = {}
             break
 
-        # Запасний варіант 1: ArduPilot сам розармував після посадки
-        if not armed:
-            print("✅ Автоматичний disarm — посадка завершена!")
+        if not vehicle.armed:
+            print("✅ Авто disarm!")
             break
 
-        # Запасний варіант 2: якщо щось пішло не так — зупиняємось через 60с
-        if time.time() - start_time > 60:
-            print("⚠️  Таймаут 60с — зупиняємо!")
+        if time.time() - start_time > 90:
+            print("⚠️  Таймаут 90с!")
             break
 
-        time.sleep(0.2)  # перевіряємо 5 разів на секунду
+        time.sleep(0.05)  # 20 Гц
 
     # ── Фінальний звіт ────────────────────────────────────────────────────────
-    time.sleep(1.0)  # чекаємо поки GPS оновиться
+    time.sleep(1.0)
     final      = vehicle.location.global_frame
     final_dist = get_distance_m(final.lat, final.lon,
                                 point_b[0], point_b[1])
     final_alt  = vehicle.location.global_relative_frame.alt
 
-    print(f"\n{'=' * 50}")
-    print(f"🎯 Точність посадки: {final_dist:.2f} м від точки Б")
+    print(f"\n{'='*50}")
+    print(f"🎯 Точність посадки: {final_dist:.2f}м від точки Б")
     print(f"📍 Позиція: {final.lat:.6f}, {final.lon:.6f}")
-    print(f"📏 Висота баро: {final_alt:+.2f} м (дрейф норм.)")
-    print(f"{'=' * 50}")
+    print(f"📏 Висота баро: {final_alt:+.2f}м (дрейф норм.)")
+    print(f"{'='*50}")
 
     return final_dist
 
@@ -401,151 +477,42 @@ def safe_land(vehicle, point_b):
 # ГОЛОВНА ПРОГРАМА
 # ═══════════════════════════════════════════════════════════════════
 
-def main():
+def     main():
     print(f"Підключаємось до {CONNECTION_STRING}...")
     vehicle = connect(CONNECTION_STRING, wait_ready=True)
-    # wait_ready=True = чекаємо поки всі датчики ініціалізуються
 
-    # ── Перевірка стартової позиції ───────────────────────────────────────────
-    loc = vehicle.location.global_frame
+    # Перевірка стартової позиції
+    loc         = vehicle.location.global_frame
     dist_from_a = get_distance_m(loc.lat, loc.lon,
                                  POINT_A[0], POINT_A[1])
     print(f"Коптер зараз:   {loc.lat:.6f}, {loc.lon:.6f}")
-    print(f"Відстань від А: {dist_from_a:.1f} м")
+    print(f"Відстань від А: {dist_from_a:.1f}м")
 
     if dist_from_a > 100:
-        print("⚠️  Коптер далеко від точки А! Перезапусти SITL.")
+        print("⚠️  Далеко від точки А! Перезапусти SITL.")
         vehicle.close()
         return
 
-    # ── Зліт до 100м ──────────────────────────────────────────────────────────
+    # Зліт
     arm_and_takeoff(vehicle, TARGET_ALT)
     time.sleep(1)
 
-    # ── Перемикаємо на STABILIZE ──────────────────────────────────────────────
-    # STABILIZE = "ручний" режим де автопілот тільки стабілізує горизонт,
-    # але не утримує позицію і висоту автоматично.
-    # Саме в цьому режимі RC Override дає повний контроль над рухом.
+    # STABILIZE для RC Override навігації
     print("Перемикаємо на STABILIZE...")
     vehicle.mode = VehicleMode("STABILIZE")
     time.sleep(1)
 
     print("Починаємо навігацію до точки Б...\n")
 
-    # ── PID коефіцієнти для Yaw ───────────────────────────────────────────────
-    # PID = Proportional-Integral-Derivative регулятор.
-    # Ми використовуємо тільки P (пропорційний) для простоти.
+    # Навігація
+    navigate_to_target(vehicle,
+                       POINT_B[0], POINT_B[1],
+                       TARGET_ALT,
+                       ARRIVAL_RADIUS)
 
-    # YAW_KP = скільки мкс RC відхилення на 1° помилки курсу.
-    # Якщо помилка 20°: yaw_out = 1500 + 20 * 5.0 = 1600 мкс
-    # Більше значення = швидший поворот, але можлива нестабільність
-    YAW_KP  = 5.0
-
-    # Максимальне відхилення yaw від нейтралі (мкс).
-    # Обмежує максимальну швидкість повороту.
-    # 100 мкс = 1500±100 = від 1400 до 1600 = помірний поворот
-    YAW_MAX = 100
-
-    # ALT_KP = скільки мкс throttle корекції на 1м відхилення висоти.
-    # Якщо висота 97м замість 100м: throttle = 1470 + 3 * 3.0 = 1479 мкс
-    ALT_KP  = 3.0
-
-    # Максимальна корекція throttle (мкс).
-    # Обмежує наскільки агресивно коригується висота.
-    ALT_MAX = 150
-
-    # Затримка між ітераціями навігаційного циклу.
-    # 0.05с = 20 Гц = 20 оновлень RC на секунду.
-    # RC Override вимагає мінімум ~10 Гц щоб не скинутись.
-    LOOP_DT = 0.05
-
-    # Змінні для розрахунку швидкості зближення з точкою Б
-    prev_time = time.time()
-    prev_dist = get_distance_m(
-        vehicle.location.global_relative_frame.lat,
-        vehicle.location.global_relative_frame.lon,
-        POINT_B[0], POINT_B[1]
-    )
-
-    # ── Головний навігаційний цикл ────────────────────────────────────────────
-    while True:
-        # Отримуємо поточний стан дрона
-        loc      = vehicle.location.global_relative_frame
-        curr_lat = loc.lat      # поточна широта
-        curr_lon = loc.lon      # поточна довгота
-        curr_alt = loc.alt      # поточна висота (відносна)
-        curr_hdg = vehicle.heading  # поточний курс (0-359°)
-
-        # Розраховуємо навігаційні параметри
-        dist    = get_distance_m(curr_lat, curr_lon,
-                                 POINT_B[0], POINT_B[1])
-        bearing = get_bearing(curr_lat, curr_lon,
-                              POINT_B[0], POINT_B[1])
-        yaw_err = heading_error(curr_hdg, bearing)
-        speed   = get_speed(vehicle)
-
-        # Швидкість зближення з точкою Б (м/с)
-        now           = time.time()
-        dt            = now - prev_time
-        closing_speed = (prev_dist - dist) / dt if dt > 0 else 0
-        prev_time     = now
-        prev_dist     = dist
-
-        print(f"Dist: {dist:7.1f}м | Alt: {curr_alt:6.1f}м | "
-              f"Hdg: {curr_hdg:3.0f}° | Bear: {bearing:3.0f}° | "
-              f"Speed: {speed:4.1f}м/с | Closing: {closing_speed:+.1f}м/с")
-
-        # ── Перевірка прибуття ────────────────────────────────────────────────
-        if dist < ARRIVAL_RADIUS:
-            print(f"\n✅ Прибули! Відстань до точки Б: {dist:.2f} м")
-            break
-
-        # ── Розрахунок Yaw (поворот до цілі) ─────────────────────────────────
-        # Якщо треба повернути вправо (yaw_err > 0) → ch4 > 1500
-        # Якщо треба повернути вліво  (yaw_err < 0) → ch4 < 1500
-        yaw_out = RC_NEUTRAL + clamp(yaw_err * YAW_KP,
-                                     -YAW_MAX, YAW_MAX)
-
-        # ── Розрахунок Pitch (рух вперед) ─────────────────────────────────────
-        # Летимо вперед тільки коли вже приблизно на курсі (помилка < 15°)
-        # Інакше спочатку розвертаємось, потім летимо
-        if abs(yaw_err) < 15:
-            if dist > 200:
-                pitch_offset = 250   # далеко → максимальна швидкість
-            elif dist > 50:
-                pitch_offset = 180   # середня відстань → швидко
-            elif dist > 20:
-                pitch_offset = 100   # близько → середня швидкість
-            elif dist > 5:
-                pitch_offset = 50    # дуже близько → повільно
-            else:
-                pitch_offset = 25    # фінальний підхід → дуже повільно
-
-            # CH2 < 1500 = нахил вперед = рух вперед (ArduPilot конвенція)
-            pitch_out = RC_NEUTRAL - pitch_offset
-        else:
-            # Стоїмо на місці поки не розвернемось
-            pitch_out = RC_NEUTRAL
-
-        # ── Розрахунок Throttle (утримання висоти) ────────────────────────────
-        # Базовий газ + пропорційна корекція на відхилення від 100м
-        # alt_err > 0 = нижче норми → додаємо газу
-        # alt_err < 0 = вище норми  → зменшуємо газ
-        alt_err      = TARGET_ALT - curr_alt
-        throttle_out = THROTTLE_HOLD + clamp(alt_err * ALT_KP,
-                                             -ALT_MAX, ALT_MAX)
-
-        # Відправляємо RC команди
-        send_rc(vehicle,
-                ch2=pitch_out,      # рух вперед/назад
-                ch3=throttle_out,   # висота
-                ch4=yaw_out)        # поворот
-
-        time.sleep(LOOP_DT)
-
-    # ── Посадка ───────────────────────────────────────────────────────────────
+    # Посадка
     safe_land(vehicle, POINT_B)
-    vehicle.close()  # закриваємо з'єднання з дроном
+    vehicle.close()
 
 
 if __name__ == '__main__':
