@@ -13,7 +13,7 @@ CONNECTION_STRING = 'tcp:127.0.0.1:5762'
 
 POINT_A = (50.450739, 30.461242)
 POINT_B = (50.443326, 30.448078)
-TARGET_ALT  = 100.0
+TARGET_ALT  = 200.0
 EARTH_RADIUS = 6371000
 
 RC_NEUTRAL    = 1500
@@ -472,12 +472,94 @@ def safe_land(vehicle, point_b):
 
     return final_dist
 
+def navigate_to_target_no_yaw(vehicle, target_lat, target_lon,
+                             target_alt, arrival_radius=3.0):
+    """
+    Навігація БЕЗ зміни yaw (yaw фіксований).
+
+    Використовує глобальні координати:
+    - North → Pitch
+    - East  → Roll
+    """
+
+    # ALT_KP  = 3.0
+    ALT_KP = 2.5 if target_alt > 150 else 3.5
+    ALT_MAX = 150
+
+    LOOP_DT = 0.05
+
+    fixed_yaw = vehicle.heading
+    print(f"🔒 Фіксуємо Yaw: {fixed_yaw}°")
+
+    while True:
+        loc = vehicle.location.global_relative_frame
+
+        curr_lat = loc.lat
+        curr_lon = loc.lon
+        curr_alt = loc.alt
+
+        # ── Відстань ─────────────────────────────────────────
+        dist = get_distance_m(curr_lat, curr_lon,
+                              target_lat, target_lon)
+
+        if dist < arrival_radius:
+            print(f"\n✅ Прибули: {dist:.2f}м")
+            send_rc(vehicle, ch3=THROTTLE_HOLD)
+            time.sleep(0.5)
+            break
+
+        # ── Глобальна помилка (метри) ───────────────────────
+        north_err = (target_lat - curr_lat) * 111320
+        east_err  = (target_lon - curr_lon) * 111320 * math.cos(
+            math.radians(curr_lat)
+        )
+
+        # ── Динамічний коефіцієнт ───────────────────────────
+        if dist > 50:
+            pos_kp = 8.0
+        elif dist > 20:
+            pos_kp = 14.0
+        elif dist > 10:
+            pos_kp = 20.0
+        elif dist > 5:
+            pos_kp = 30.0
+        else:
+            pos_kp = 45.0
+
+        POS_MAX = 300
+
+        # ❗ ГОЛОВНА ЗМІНА
+        pitch_out = RC_NEUTRAL - clamp(north_err * pos_kp,
+                                       -POS_MAX, POS_MAX)
+
+        roll_out  = RC_NEUTRAL + clamp(east_err * pos_kp,
+                                       -POS_MAX, POS_MAX)
+
+        # ── Висота ──────────────────────────────────────────
+        alt_err      = target_alt - curr_alt
+        throttle_out = THROTTLE_HOLD + clamp(alt_err * ALT_KP,
+                                             -ALT_MAX, ALT_MAX)
+
+        # ── YAW ФІКСОВАНИЙ ─────────────────────────────────
+        yaw_out = RC_NEUTRAL
+
+        print(f"Dist:{dist:6.1f}м | Alt:{curr_alt:5.1f}м | "
+              f"N:{north_err:+6.1f} | E:{east_err:+6.1f}")
+
+        send_rc(vehicle,
+                ch1=roll_out,
+                ch2=pitch_out,
+                ch3=throttle_out,
+                ch4=yaw_out)
+
+        time.sleep(LOOP_DT)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # ГОЛОВНА ПРОГРАМА
 # ═══════════════════════════════════════════════════════════════════
 
-def     main():
+def main():
     print(f"Підключаємось до {CONNECTION_STRING}...")
     vehicle = connect(CONNECTION_STRING, wait_ready=True)
 
@@ -505,10 +587,13 @@ def     main():
     print("Починаємо навігацію до точки Б...\n")
 
     # Навігація
-    navigate_to_target(vehicle,
-                       POINT_B[0], POINT_B[1],
-                       TARGET_ALT,
-                       ARRIVAL_RADIUS)
+    # navigate_to_target(vehicle,
+    #                    POINT_B[0], POINT_B[1],
+    #                    TARGET_ALT,
+    #                    ARRIVAL_RADIUS)
+
+    navigate_to_target_no_yaw(vehicle, POINT_B[0], POINT_B[1], TARGET_ALT)
+    # navigate_ultra_precise(vehicle, POINT_B[0], POINT_B[1], TARGET_ALT)
 
     # Посадка
     safe_land(vehicle, POINT_B)
